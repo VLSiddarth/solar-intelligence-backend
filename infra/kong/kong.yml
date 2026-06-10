@@ -1,0 +1,36 @@
+_format_version: "3.0"
+_transform: true
+
+services:
+  - name: si-api
+    url: http://si-api:8888
+    connect_timeout: 5000
+    write_timeout:   10000
+    read_timeout:    30000
+    retries: 3
+    routes:
+      - name: api-routes
+        paths: ["/"]  # Wildcard catches all traffic to the API
+        strip_path: false
+
+plugins:
+  - name: rate-limiting
+    config:
+      policy: local
+      minute: 1000          
+      hour: 50000           
+      error_message: "SI rate limit exceeded for your tenant."
+    enabled: true
+
+  - name: correlation-id
+    config:
+      header_name: X-Correlation-ID
+      generator: uuid#counter
+      echo_downstream: true
+    enabled: true
+
+  - name: request-size-limiting
+    config:
+      allowed_payload_size: 10   
+      size_unit: megabytes
+    enabled: true

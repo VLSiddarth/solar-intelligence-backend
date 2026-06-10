@@ -1,0 +1,9 @@
+# ============================================================
+# Redpanda Console config
+# CRITICAL: Must use port 29092 (PLAINTEXT internal listener)
+# Port 9092 is the OUTSIDE listener — it advertises localhost:9092
+# which is unreachable from inside the console container.
+# ============================================================
+kafka:
+  brokers:
+    - si-redpanda:29092

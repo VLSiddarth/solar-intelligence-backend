@@ -1,0 +1,85 @@
+# ============================================================
+# infra/prometheus/alerts.yml
+# SLA-based alert rules — fires when SI misses its own targets
+# ============================================================
+
+groups:
+  - name: si_sla_alerts
+    interval: 30s
+    rules:
+
+      # P99 latency SLA breach
+      - alert: SI_P99LatencyBreached
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket{job="si-api"}[5m])) by (le)
+          ) > 1.5
+        for: 2m
+        labels:
+          severity: critical
+          layer: photosphere
+        annotations:
+          summary: "SI P99 latency > 1500ms (SLA breach)"
+          description: "P99 latency is {{ $value | humanizeDuration }}. SLA target: 1500ms."
+
+      # High error rate
+      - alert: SI_HighErrorRate
+        expr: |
+          sum(rate(http_requests_total{job="si-api", status=~"5.."}[5m]))
+          / sum(rate(http_requests_total{job="si-api"}[5m])) > 0.05
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SI error rate > 5%"
+          description: "Error rate is {{ $value | humanizePercentage }}."
+
+      # Kafka consumer lag
+      - alert: SI_KafkaConsumerLag
+        expr: kafka_consumer_group_lag > 10000
+        for: 5m
+        labels:
+          severity: warning
+          layer: core
+        annotations:
+          summary: "SI Kafka consumer lag > 10,000 messages"
+          description: "Consumer group is falling behind. Possible ingestion bottleneck."
+
+      # Redis memory pressure
+      - alert: SI_RedisMemoryHigh
+        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.85
+        for: 5m
+        labels:
+          severity: warning
+          layer: convective
+        annotations:
+          summary: "Redis memory > 85% — agent state at risk"
+
+      # Enforcement loop slow
+      - alert: SI_EnforcementLoopSlow
+        expr: si_enforcement_loop_latency_ms > 100
+        for: 1m
+        labels:
+          severity: critical
+          layer: corona
+        annotations:
+          summary: "SI enforcement loop > 100ms (target: <50ms)"
+
+      # Vector index degraded
+      - alert: SI_VectorIndexDegraded
+        expr: si_vector_index_recall < 0.87
+        for: 2m
+        labels:
+          severity: critical
+          layer: radiative
+        annotations:
+          summary: "SI vector recall < 87% SLA target"
+
+      # Service down
+      - alert: SI_ServiceDown
+        expr: up{job="si-api"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "SI API is DOWN"

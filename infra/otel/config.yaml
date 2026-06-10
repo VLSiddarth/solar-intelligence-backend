@@ -1,0 +1,96 @@
+# ============================================================
+# infra/otel/config.yaml
+# OpenTelemetry Collector — receives, processes, exports traces
+# Pipeline: SI layers → OTLP → Collector → Jaeger + Prometheus
+# ============================================================
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # Self-monitoring
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: "otel-collector"
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["localhost:8888"]
+
+processors:
+  # Batch spans before export (reduces network overhead)
+  batch:
+    send_batch_size:    512
+    send_batch_max_size: 1024
+    timeout:            5s
+
+  # Memory limiter — prevents OOM in high-throughput scenarios
+  memory_limiter:
+    check_interval: 1s
+    limit_mib:      512
+    spike_limit_mib: 128
+
+  # Add SI-specific attributes to every span
+  resource:
+    attributes:
+      - key: "deployment.environment"
+        value: "solar-intelligence"
+        action: upsert
+      - key: "service.namespace"
+        value: "si"
+        action: upsert
+
+  # Filter out health check noise
+  filter/health:
+    error_mode: ignore
+    traces:
+      span:
+        - 'attributes["http.route"] == "/health"'
+        - 'attributes["http.route"] == "/ready"'
+        - 'attributes["http.route"] == "/live"'
+
+exporters:
+  # Jaeger for distributed tracing UI
+  otlp/jaeger:
+    endpoint: jaeger:14250
+    tls:
+      insecure: true
+
+  # Prometheus metrics
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    namespace: "si"
+    send_timestamps: true
+    resource_to_telemetry_conversion:
+      enabled: true
+
+  # Debug logging (disable in production)
+  debug:
+    verbosity: normal
+
+service:
+  pipelines:
+    traces:
+      receivers:   [otlp]
+      processors:  [memory_limiter, filter/health, resource, batch]
+      exporters:   [otlp/jaeger, debug]
+
+    metrics:
+      receivers:   [otlp, prometheus]
+      processors:  [memory_limiter, batch]
+      exporters:   [prometheus]
+
+    logs:
+      receivers:   [otlp]
+      processors:  [memory_limiter, batch]
+      exporters:   [debug]
+
+  telemetry:
+    logs:
+      level: "warn"
+    metrics:
+      address: ":8888"

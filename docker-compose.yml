@@ -1,0 +1,457 @@
+# ============================================================
+# SOLAR INTELLIGENCE — Full Stack Docker Compose  (FIXED)
+# Boot:   docker compose up -d
+# Verify: python scripts/health_check.py
+#
+# KEY FIXES applied:
+#   1. redpanda: --advertise-kafka-addr uses si-redpanda:29092 for PLAINTEXT
+#      (OUTSIDE still advertises localhost:9092 for host access)
+#   2. bitnami/etcd (not bitnamilegacy) — correct image name
+#   3. si-worker: new fusion worker service — consumes Kafka → embedding → graphrag
+#   4. si-worker: complete env vars (POSTGRES, EMBEDDING, GROQ, VECTOR)
+#   5. KAFKA_BOOTSTRAP_SERVERS: uses port 29092 (PLAINTEXT) for all internal services
+#   6. KAFKA_TOPIC_RAW_DOCS explicitly set so producer+consumer use same name
+#   7. si-worker depends_on includes postgres + tgi (needs them to work)
+# ============================================================
+
+networks:
+  si-net:
+    driver: bridge
+
+volumes:
+  redpanda-data:
+  falkordb-data:
+  milvus-data:
+  etcd-data:
+  minio-data:
+  postgres-data:
+  redis-data:
+  hf-cache:
+  grafana-data:
+  prometheus-data:
+
+services:
+
+  # ──────────────────────────────────────────────
+  # LAYER I — CORE: Data Fusion Engine
+  # ──────────────────────────────────────────────
+
+  redpanda:
+    image: redpandadata/redpanda:v24.1.1
+    container_name: si-redpanda
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --overprovisioned
+      - --kafka-addr=PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      # FIX 1: PLAINTEXT listener advertises si-redpanda:29092 (for Docker-internal clients)
+      #        OUTSIDE listener advertises localhost:9092 (for host access from Windows)
+      - --advertise-kafka-addr=PLAINTEXT://si-redpanda:29092,OUTSIDE://localhost:9092
+      - --pandaproxy-addr=0.0.0.0:8082
+      - --advertise-pandaproxy-addr=localhost:8082
+    ports:
+      - "9092:9092"   # OUTSIDE — host access
+      - "29092:29092" # PLAINTEXT — expose for debugging (not required)
+      - "8082:8082"
+      - "9644:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    networks:
+      - si-net
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "info"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redpanda-console:
+    image: redpandadata/console:v2.6.0
+    container_name: si-redpanda-console
+    ports:
+      - "8085:8080"
+    environment:
+      CONFIG_FILEPATH: /etc/redpanda/redpanda-console-config.yaml
+    volumes:
+      # FIX: redpanda-console.yaml now correctly uses si-redpanda:29092
+      - ./infra/docker/redpanda-console.yaml:/etc/redpanda/redpanda-console-config.yaml
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    networks:
+      - si-net
+
+  flink-jobmanager:
+    image: flink:1.19-scala_2.12-java17
+    container_name: si-flink-jobmanager
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        execution.checkpointing.interval: 30s
+        execution.checkpointing.mode: EXACTLY_ONCE
+        state.backend: rocksdb
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+    volumes:
+      - ./core/flink:/opt/flink/jobs
+    networks:
+      - si-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/overview"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+
+  flink-taskmanager:
+    image: flink:1.19-scala_2.12-java17
+    container_name: si-flink-taskmanager
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+    depends_on:
+      - flink-jobmanager
+    networks:
+      - si-net
+
+  falkordb:
+    image: falkordb/falkordb:latest
+    container_name: si-falkordb
+    ports:
+      - "6380:6379"
+    volumes:
+      - falkordb-data:/data
+    networks:
+      - si-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6379", "PING"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  # ──────────────────────────────────────────────
+  # LAYER II — RADIATIVE: Vector Transport
+  # ──────────────────────────────────────────────
+
+  etcd:
+    # FIX 2: bitnami (not bitnamilegacy) — correct Docker Hub namespace
+    image: bitnami/etcd:3.5.12
+    container_name: si-etcd
+    environment:
+      ALLOW_NONE_AUTHENTICATION: "yes"
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+    volumes:
+      - etcd-data:/bitnami/etcd
+    networks:
+      - si-net
+
+  minio:
+    image: minio/minio:latest
+    container_name: si-minio
+    command: minio server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: si_minio
+      MINIO_ROOT_PASSWORD: si_minio_secret
+    ports:
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - si-net
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  milvus:
+    image: milvusdb/milvus:v2.4.4
+    container_name: si-milvus
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: si_minio
+      MINIO_SECRET_ACCESS_KEY: si_minio_secret
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    volumes:
+      - milvus-data:/var/lib/milvus
+    depends_on:
+      - etcd
+      - minio
+    networks:
+      - si-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: si-postgres
+    environment:
+      POSTGRES_DB: si_vectors
+      POSTGRES_USER: si_user
+      POSTGRES_PASSWORD: si_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init_postgres.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - si-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U si_user -d si_vectors"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  tgi:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.7
+    container_name: si-tgi
+    command: --model-id BAAI/bge-m3 --port 8080 --max-client-batch-size 32
+    ports:
+      - "8080:8080"
+    volumes:
+      - hf-cache:/data
+    networks:
+      - si-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 15
+
+  # ──────────────────────────────────────────────
+  # LAYER III — CONVECTIVE: Agentic Routing
+  # ──────────────────────────────────────────────
+
+  redis:
+    image: redis/redis-stack:7.2.0-v10
+    container_name: si-redis
+    ports:
+      - "6379:6379"
+      - "8001:8001"   # RedisInsight UI
+    volumes:
+      - redis-data:/data
+      - ./infra/docker/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf
+    networks:
+      - si-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "PING"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ──────────────────────────────────────────────
+  # LAYER IV — PHOTOSPHERE: API + Gateway
+  # ──────────────────────────────────────────────
+
+  si-api:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.api
+    container_name: si-api
+    ports:
+      - "8888:8888"
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://si-otel-collector:4317
+      # FIX: Internal broker uses port 29092 (PLAINTEXT listener)
+      KAFKA_BOOTSTRAP_SERVERS: si-redpanda:29092
+      # FIX: Explicit topic name — producer and worker must match
+      KAFKA_TOPIC_RAW_DOCS: "si.core.raw_documents"
+      MILVUS_HOST: si-milvus
+      FALKORDB_HOST: si-falkordb
+      FALKORDB_PORT: 6379
+      REDIS_HOST: si-redis
+      POSTGRES_HOST: si-postgres
+      EMBEDDING_HOST: si-tgi
+      EMBEDDING_PORT: 8080
+      VECTOR_BACKEND: pgvector
+      MTLS_ENABLED: "false"
+      SI_ENV: development
+      LLM_PROVIDER: groq
+      GROQ_MODEL: llama-3.1-8b-instant
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      KU_API_KEY: ${KU_API_KEY:-}
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+      falkordb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./certs:/app/certs:ro
+    networks:
+      - si-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8888/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+
+  # ──────────────────────────────────────────────
+  # FUSION WORKER — NEW SERVICE
+  # Consumes from Kafka → generates embeddings → writes to pgvector + FalkorDB
+  # This is what was missing! Ingest returned "queued" but nothing processed it.
+  # ──────────────────────────────────────────────
+  si-worker:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile.api
+    container_name: si-worker
+    # Override the default uvicorn CMD — run the fusion worker instead
+    command: python core/worker/main.py
+    environment:
+      # Kafka
+      KAFKA_BOOTSTRAP_SERVERS: si-redpanda:29092
+      KAFKA_TOPIC_RAW_DOCS: "si.core.raw_documents"
+      KAFKA_CONSUMER_GROUP: "si-core-group"
+      # Vector storage
+      VECTOR_BACKEND: pgvector
+      POSTGRES_HOST: si-postgres
+      POSTGRES_DB: si_vectors
+      POSTGRES_USER: si_user
+      POSTGRES_PASSWORD: si_password
+      # Graph storage
+      FALKORDB_HOST: si-falkordb
+      FALKORDB_PORT: 6379
+      # Embedding model
+      EMBEDDING_HOST: si-tgi
+      EMBEDDING_PORT: 8080
+      # LLM for entity extraction
+      LLM_PROVIDER: groq
+      GROQ_MODEL: llama-3.1-8b-instant
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      SI_ENV: development
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      falkordb:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      # Worker waits for TGI — it needs embeddings to work
+      tgi:
+        condition: service_healthy
+    networks:
+      - si-net
+    restart: unless-stopped   # Auto-restart if it crashes
+
+  kong:
+    image: kong:3.7
+    container_name: si-kong
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /kong/declarative/kong.yml
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_LISTEN: "0.0.0.0:8002"
+      KONG_PROXY_LISTEN: "0.0.0.0:8000, 0.0.0.0:8443 ssl"
+    ports:
+      - "8000:8000"
+      - "8443:8443"
+      - "8002:8002"
+    volumes:
+      - ./infra/kong:/kong/declarative:ro
+      - ./certs:/certs:ro
+    depends_on:
+      si-api:
+        condition: service_healthy
+    networks:
+      - si-net
+    healthcheck:
+      test: ["CMD", "kong", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+
+  # ──────────────────────────────────────────────
+  # LAYER V — CORONA: Telemetry + Observability
+  # ──────────────────────────────────────────────
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.101.0
+    container_name: si-otel-collector
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - ./infra/otel/config.yaml:/etc/otel/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8889:8888"   # Prometheus metrics (collector self)
+    depends_on:
+      - jaeger
+      - prometheus
+    networks:
+      - si-net
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: si-jaeger
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "14250:14250"   # gRPC
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    networks:
+      - si-net
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: si-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+    networks:
+      - si-net
+
+  grafana:
+    image: grafana/grafana:10.4.3
+    container_name: si-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: si_admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: grafana-clock-panel
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    networks:
+      - si-net
