@@ -1,27 +1,25 @@
 # ============================================================
-# core/worker/main.py
-# Fusion Worker — the missing link between Kafka and the knowledge graph.
+# core/worker/main.py  — v2 FINAL
 #
-# This is WHY ingest returns "queued" but nothing appeared in Redpanda:
-# the API only PRODUCES to Kafka. This worker CONSUMES and processes.
-#
-# Flow per document:
-#   Kafka (si.core.raw_documents)
-#     → embed via TGI (BGE-M3)
-#     → store vector in pgvector (active blue/green index)
-#     → GraphRAG extraction via Groq
-#     → write entities + edges to FalkorDB
-#     → commit Kafka offset (exactly-once)
+# CHANGES FROM v1:
+#   1. Added mark_processed() call after successful document
+#      processing so AutonomousAgent._wait_for_processing() resolves.
+#   2. Added explicit logging at each processing step so you can
+#      trace exactly where failures happen in docker logs.
+#   3. Added SI_API_BASE_URL env var (defaults to http://si-api:8888)
+#      so the worker can call the mark-processed endpoint.
 # ============================================================
 
 import asyncio
 import json
+import os
 import logging
 import signal
 import sys
 import uuid
 from typing import Optional
 
+import httpx
 from confluent_kafka import Consumer, KafkaError, Message
 
 from shared.config.settings import settings
@@ -30,8 +28,40 @@ from shared.utils.logging import configure_logging, get_logger
 
 logger = get_logger(__name__)
 
+# Internal API URL — use Docker service name, not localhost
+SI_API_BASE_URL = os.getenv("SI_API_BASE_URL", "http://si-api:8888")
+
+
 # ─────────────────────────────────────────────────────────────
-# Async processing pipeline
+# Mark-processed callback
+# ─────────────────────────────────────────────────────────────
+
+async def mark_doc_processed(doc_id: str, tenant_id: str) -> None:
+    """
+    Notify the SI API that this document has been fully processed.
+    This transitions the doc status from 'pending' → 'processed'
+    so the AutonomousAgent polling loop can resolve.
+    """
+    try:
+        async with httpx.AsyncClient(
+            base_url=SI_API_BASE_URL,
+            timeout=5.0,
+        ) as client:
+            await client.post(
+                f"/v1/ingest/{doc_id}/mark-processed",
+                headers={"X-Tenant-ID": tenant_id},
+            )
+        logger.info("worker_marked_processed", extra={"doc_id": doc_id})
+    except Exception as e:
+        # Non-fatal — document is still processed. Agent will time out polling.
+        logger.warning("worker_mark_processed_failed", extra={
+            "doc_id": doc_id,
+            "error":  str(e),
+        })
+
+
+# ─────────────────────────────────────────────────────────────
+# Pipeline init
 # ─────────────────────────────────────────────────────────────
 
 async def build_pipeline():
@@ -48,6 +78,7 @@ async def build_pipeline():
     pipeline = GraphRAGPipeline()
 
     # Wait for TGI to be ready (it can take a few minutes on first boot)
+    logger.info("worker_waiting_for_tgi")
     for attempt in range(30):
         healthy = await embedder.health()
         if healthy:
@@ -61,6 +92,10 @@ async def build_pipeline():
     return embedder, index, pipeline
 
 
+# ─────────────────────────────────────────────────────────────
+# Document processing pipeline
+# ─────────────────────────────────────────────────────────────
+
 async def process_document(
     payload: dict,
     embedder,
@@ -72,34 +107,48 @@ async def process_document(
 
     Steps:
         1. Deserialise RawDocument from Kafka payload
-        2. Generate 1024-dim BGE-M3 embedding
-        3. Store in active pgvector index
+        2. Generate BGE-M3 embedding via TGI
+        3. Store vector in pgvector (blue/green index)
         4. Run GraphRAG extraction (Groq → entities/relationships → FalkorDB)
+        5. Mark document as processed (notifies the API status endpoint)
     """
-    # Strip internal Kafka headers that aren't part of RawDocument schema
+    # Strip internal Kafka metadata fields
     clean = {k: v for k, v in payload.items() if not k.startswith("_")}
 
     try:
         doc = RawDocument(**clean)
     except Exception as e:
-        logger.error("worker_deserialise_failed", extra={"error": str(e), "keys": list(clean.keys())})
+        logger.error("worker_deserialise_failed", extra={
+            "error": str(e),
+            "keys":  list(clean.keys()),
+        })
         return
 
-    doc_id = doc.doc_id
-    logger.info("worker_processing", extra={
+    doc_id    = doc.doc_id
+    tenant_id = doc.tenant_id
+    logger.info("worker_processing_start", extra={
         "doc_id":      doc_id,
         "title":       doc.title or "untitled",
         "content_len": len(doc.content),
-        "tenant_id":   doc.tenant_id,
+        "tenant_id":   tenant_id,
     })
 
+    processing_ok = True   # Track whether to mark as processed or failed
+
     # ── Step 1: Embed ─────────────────────────────────────────
+    embedding = []
     try:
         embedding = await embedder.embed_single(doc.content[:2000])
-        logger.info("worker_embedding_done", extra={"doc_id": doc_id, "dim": len(embedding)})
+        logger.info("worker_embedding_done", extra={
+            "doc_id": doc_id,
+            "dim":    len(embedding),
+        })
     except Exception as e:
-        logger.error("worker_embedding_failed", extra={"doc_id": doc_id, "error": str(e)})
-        embedding = []
+        logger.error("worker_embedding_failed", extra={
+            "doc_id": doc_id,
+            "error":  str(e),
+        })
+        processing_ok = False
 
     # ── Step 2: Store in pgvector ────────────────────────────
     if embedding:
@@ -109,13 +158,17 @@ async def process_document(
             index.insert([{
                 "vector_id":    doc_id,
                 "entity_id":    doc_id,
-                "tenant_id":    doc.tenant_id,
+                "tenant_id":    tenant_id,
                 "embedding":    embedding,
                 "content_hash": content_hash,
             }])
             logger.info("worker_vector_stored", extra={"doc_id": doc_id})
         except Exception as e:
-            logger.error("worker_vector_store_failed", extra={"doc_id": doc_id, "error": str(e)})
+            logger.error("worker_vector_store_failed", extra={
+                "doc_id": doc_id,
+                "error":  str(e),
+            })
+            processing_ok = False
 
     # ── Step 3: GraphRAG extraction ──────────────────────────
     try:
@@ -127,15 +180,26 @@ async def process_document(
             "cost":          fused.token_cost,
         })
     except Exception as e:
-        # GraphRAG failure is non-fatal: document is still searchable via vector
+        # GraphRAG failure is non-fatal: document is still vector-searchable
         logger.warning("worker_graphrag_failed_doc_still_searchable", extra={
             "doc_id": doc_id,
             "error":  str(e),
         })
 
+    # ── Step 4: Mark processed ───────────────────────────────
+    # Always call this (even on partial failure) so the agent polling loop
+    # doesn't sit waiting for the full PROCESS_WAIT_TIMEOUT.
+    await mark_doc_processed(doc_id, tenant_id)
+
+    logger.info("worker_processing_complete", extra={
+        "doc_id":       doc_id,
+        "has_embedding": bool(embedding),
+        "success":      processing_ok,
+    })
+
 
 # ─────────────────────────────────────────────────────────────
-# Kafka consumer loop (async)
+# Kafka consumer loop
 # ─────────────────────────────────────────────────────────────
 
 async def consume_loop(
@@ -145,15 +209,15 @@ async def consume_loop(
     shutdown_event: asyncio.Event,
 ) -> None:
     consumer = Consumer({
-        "bootstrap.servers":        settings.kafka.bootstrap_servers,
-        "group.id":                 f"{settings.kafka.consumer_group}-worker",
-        "auto.offset.reset":        "earliest",
-        "enable.auto.commit":       False,   # Manual commit after successful processing
-        "isolation.level":          "read_committed",  # Only see committed txn messages
-        "max.poll.interval.ms":     300_000,
-        "session.timeout.ms":       30_000,
-        "fetch.min.bytes":          1,
-        "fetch.wait.max.ms":        500,
+        "bootstrap.servers":    settings.kafka.bootstrap_servers,
+        "group.id":             f"{settings.kafka.consumer_group}-worker",
+        "auto.offset.reset":    "earliest",
+        "enable.auto.commit":   False,     # Manual commit after processing
+        "isolation.level":      "read_committed",
+        "max.poll.interval.ms": 300_000,
+        "session.timeout.ms":   30_000,
+        "fetch.min.bytes":      1,
+        "fetch.wait.max.ms":    500,
     })
     consumer.subscribe([settings.kafka.topic_raw_docs])
 
@@ -183,7 +247,7 @@ async def consume_loop(
             try:
                 payload = json.loads(msg.value().decode("utf-8"))
                 await process_document(payload, embedder, index, graphrag_pipeline)
-                consumer.commit(msg, asynchronous=False)  # Exactly-once: commit after success
+                consumer.commit(msg, asynchronous=False)
                 processed += 1
 
                 if processed % 10 == 0:
@@ -194,16 +258,15 @@ async def consume_loop(
 
             except Exception as e:
                 errors += 1
-                logger.error("worker_message_failed", extra={
+                logger.error("worker_message_processing_failed", extra={
                     "error":     str(e),
                     "topic":     msg.topic(),
                     "partition": msg.partition(),
                     "offset":    msg.offset(),
                 })
-                # Do NOT commit — message will be redelivered
+                # Don't commit offset — message will be redelivered
 
-            # Yield control so other async tasks can run
-            await asyncio.sleep(0)
+            await asyncio.sleep(0)   # Yield to event loop
 
     finally:
         consumer.close()
@@ -221,9 +284,10 @@ async def main() -> None:
     configure_logging(level=settings.log_level, json_output=settings.is_production)
 
     logger.info("fusion_worker_starting", extra={
-        "llm_provider": settings.llm_provider,
-        "topic":        settings.kafka.topic_raw_docs,
+        "llm_provider":   settings.llm_provider,
+        "topic":          settings.kafka.topic_raw_docs,
         "vector_backend": settings.vector.backend,
+        "si_api_url":     SI_API_BASE_URL,
     })
 
     shutdown_event = asyncio.Event()

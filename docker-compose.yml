@@ -246,7 +246,6 @@ services:
     volumes:
       - redis-data:/data
       - ./infra/docker/redis.conf:/usr/local/etc/redis/redis.conf
-    command: redis-server /usr/local/etc/redis/redis.conf
     networks:
       - si-net
     healthcheck:
@@ -286,6 +285,7 @@ services:
       GROQ_MODEL: llama-3.1-8b-instant
       GROQ_API_KEY: ${GROQ_API_KEY}
       KU_API_KEY: ${KU_API_KEY:-}
+      VECTOR_DIMENSION: "384"        # ← ADD THIS LINE
     dns:
       - 8.8.8.8
       - 1.1.1.1
@@ -325,6 +325,7 @@ services:
     # Override the default uvicorn CMD — run the fusion worker instead
     command: python core/worker/main.py
     environment:
+      PYTHONPATH: /app                        # ← ADD THIS LINE
       # Kafka
       KAFKA_BOOTSTRAP_SERVERS: si-redpanda:29092
       KAFKA_TOPIC_RAW_DOCS: "si.core.raw_documents"
@@ -346,6 +347,9 @@ services:
       GROQ_MODEL: llama-3.1-8b-instant
       GROQ_API_KEY: ${GROQ_API_KEY}
       SI_ENV: development
+      VECTOR_DIMENSION: "384"        # ← ADD THIS LINE
+      SI_API_BASE_URL: "http://si-api:8888"  # ← ADD THIS LINE
+      
     dns:
       - 8.8.8.8
       - 1.1.1.1
@@ -447,7 +451,6 @@ services:
     environment:
       GF_SECURITY_ADMIN_PASSWORD: si_admin
       GF_USERS_ALLOW_SIGN_UP: "false"
-      GF_INSTALL_PLUGINS: grafana-clock-panel
     volumes:
       - grafana-data:/var/lib/grafana
       - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro

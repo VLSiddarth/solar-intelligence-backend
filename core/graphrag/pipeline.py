@@ -367,20 +367,27 @@ class GraphRAGPipeline:
         return validated
 
     def _write_to_graph(self, entities: list, relationships: list, tenant_id: str) -> None:
+        # FIX: FalkorDB Cypher requires SET n += $map (map param), NOT SET n += {key: $key}
+        # The original generated invalid syntax: SET n += {entity_id: $entity_id, name: $name, ...}
+        # FalkorDB rejects inline parameter references inside map literals.
         for entity in entities:
             props = {
                 "entity_id":  entity.entity_id,
                 "name":       entity.name,
                 "tenant_id":  tenant_id,
                 "source_doc": entity.source_doc_id,
-                **entity.fields,
             }
-            props_str = ", ".join(f"{k}: ${k}" for k in props)
+            # Merge any extra fields (sanitise keys — no spaces or special chars)
+            for k, v in entity.fields.items():
+                safe_key = k.replace(" ", "_").replace("-", "_")
+                if safe_key.isidentifier():
+                    props[safe_key] = v
+
             query = (
                 f"MERGE (n:{entity.entity_type.value} {{entity_id: $entity_id}}) "
-                f"SET n += {{{props_str}}}"
+                f"SET n += $props"
             )
-            self.graph.query(query, props)
+            self.graph.query(query, {"entity_id": entity.entity_id, "props": props})
 
         for rel in relationships:
             query = (
