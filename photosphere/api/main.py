@@ -1,7 +1,10 @@
 # ============================================================
-# photosphere/api/main.py
-# FastAPI application — the Photosphere boundary
-# All requests enter and exit through here
+# photosphere/api/main.py — FIXED
+#
+# BUG FIXED: agents router was never registered.
+#   The file exists at photosphere/api/routes/agents.py but was
+#   never imported or included in the FastAPI app — so all
+#   /v1/agent/* endpoints returned 404.
 # ============================================================
 
 import time
@@ -11,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from photosphere.api.routes import ingest, query, health, admin, mcp
+from photosphere.api.routes import agents                        # FIXED: was missing
 from photosphere.middleware.correlation import CorrelationMiddleware
 from photosphere.middleware.tenant import TenantMiddleware
 from corona.telemetry.tracer import setup_telemetry, get_tracer
@@ -73,11 +77,12 @@ def create_app() -> FastAPI:
     app.add_middleware(CorrelationMiddleware)
 
     # ── Routers ────────────────────────────────
-    app.include_router(health.router,  prefix="",     tags=["Health"])
-    app.include_router(ingest.router,  prefix="/v1",  tags=["Ingest"])
-    app.include_router(query.router,   prefix="/v1",  tags=["Query"])
+    app.include_router(health.router,  prefix="",          tags=["Health"])
+    app.include_router(ingest.router,  prefix="/v1",       tags=["Ingest"])
+    app.include_router(query.router,   prefix="/v1",       tags=["Query"])
     app.include_router(admin.router,   prefix="/v1/admin", tags=["Admin"])
-    app.include_router(mcp.router,     prefix="",     tags=["MCP"]) # ADDED ROUTER HERE
+    app.include_router(mcp.router,     prefix="",          tags=["MCP"])
+    app.include_router(agents.router,  prefix="/v1",       tags=["Agents"])  # FIXED
 
     # V2 placeholder (N-1 backward compat maintained)
     from fastapi import APIRouter

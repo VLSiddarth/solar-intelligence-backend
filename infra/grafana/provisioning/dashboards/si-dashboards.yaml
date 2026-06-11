@@ -1,0 +1,16 @@
+# ============================================================
+# infra/grafana/provisioning/dashboards/si-dashboards.yaml
+# Tells Grafana where to load dashboard JSON files from
+# ============================================================
+
+apiVersion: 1
+
+providers:
+  - name: 'Solar Intelligence'
+    orgId: 1
+    folder: 'SI'
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards

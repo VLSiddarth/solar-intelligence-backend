@@ -1,21 +1,20 @@
 # ============================================================
-# convective/agents/autonomous_agent.py
-# 72-Hour Autonomous Agent for Solar Intelligence + KU API
+# convective/agents/autonomous_agent.py — FIXED
 #
-# Architecture:
-#   Every 30 min:
-#     1. Call KU API → discover new/updated documents for configured topics
-#     2. Ingest discovered docs into SI pipeline (POST /v1/ingest)
-#     3. Wait for fusion worker to process (poll /v1/ingest/{id}/status)
-#     4. Run synthesis query (POST /v1/query) — build insight report
-#     5. Check decay thresholds — trigger re-index if knowledge is stale
-#     6. Checkpoint state to Redis
-#   Every 12 hours: generate comprehensive report
-#   At 72 hours: final report + graceful shutdown
+# BUG FIXED: SI_API_BASE_URL was hardcoded to "http://localhost:8888"
+#   Inside Docker, 'localhost' resolves to the container itself,
+#   NOT the si-api container. The agent would get ConnectionRefused
+#   on every ingest and synthesis call.
+#   Fix: read from SI_API_BASE_URL env var, default to "http://si-api:8888"
+#
+# BUG FIXED: _wait_for_processing() polled /v1/ingest/{id}/status
+#   which didn't exist in the original routes — always returned 404.
+#   Fix: endpoint now exists in the fixed ingest.py
 # ============================================================
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -70,11 +69,11 @@ class AgentState:
     cycle_count:      int
     total_docs:       int
     total_insights:   int
-    cycles:           list[dict]            = field(default_factory=list)
-    findings:         list[str]             = field(default_factory=list)
-    decay_alerts:     list[str]             = field(default_factory=list)
-    reports:          list[dict]            = field(default_factory=list)
-    error:            Optional[str]         = None
+    cycles:           list[dict]   = field(default_factory=list)
+    findings:         list[str]    = field(default_factory=list)
+    decay_alerts:     list[str]    = field(default_factory=list)
+    reports:          list[dict]   = field(default_factory=list)
+    error:            Optional[str] = None
 
     def to_redis(self) -> str:
         d = asdict(self)
@@ -105,12 +104,15 @@ class AutonomousAgent:
         asyncio.create_task(agent.run(goal="...", topics=[...]))
     """
 
-    CYCLE_INTERVAL_SECONDS  = 30 * 60       # 30 minutes between cycles
-    TOTAL_DURATION_SECONDS  = 72 * 60 * 60  # 72 hours total
-    REPORT_INTERVAL_CYCLES  = 24            # Full report every 12 hours (24 × 30min)
-    DECAY_ALERT_THRESHOLD   = 0.4           # Decay score below this triggers alert
-    PROCESS_WAIT_TIMEOUT    = 60            # Seconds to wait for doc processing
-    SI_API_BASE_URL         = "http://localhost:8888"   # Internal API (or si-api:8888 in Docker)
+    CYCLE_INTERVAL_SECONDS  = 30 * 60        # 30 minutes between cycles
+    TOTAL_DURATION_SECONDS  = 72 * 60 * 60   # 72 hours total
+    REPORT_INTERVAL_CYCLES  = 24             # Full report every 12 hours (24 × 30min)
+    DECAY_ALERT_THRESHOLD   = 0.4            # Decay score below this triggers alert
+    PROCESS_WAIT_TIMEOUT    = 60             # Seconds to wait for doc processing
+
+    # FIXED: Read from env. Default is Docker internal hostname.
+    # Set SI_API_BASE_URL=http://localhost:8888 when running agent outside Docker.
+    SI_API_BASE_URL = os.getenv("SI_API_BASE_URL", "http://si-api:8888")
 
     def __init__(self, agent_id: Optional[str] = None):
         self._agent_id = agent_id or str(uuid.uuid4())
@@ -134,7 +136,7 @@ class AutonomousAgent:
     async def run(self, goal: str, topics: list[str]) -> None:
         """
         Main entry point. Runs the full 72-hour agent loop.
-        Call this as an asyncio.create_task() — it runs in the background.
+        Call this as asyncio.create_task() — it runs in the background.
         """
         self._state = AgentState(
             agent_id=self._agent_id,
@@ -150,10 +152,11 @@ class AutonomousAgent:
         self._save_state()
 
         logger.info("autonomous_agent_started", extra={
-            "agent_id": self._agent_id,
-            "goal":     goal,
-            "topics":   topics,
-            "duration": f"{self.TOTAL_DURATION_SECONDS // 3600}h",
+            "agent_id":  self._agent_id,
+            "goal":      goal,
+            "topics":    topics,
+            "duration":  f"{self.TOTAL_DURATION_SECONDS // 3600}h",
+            "api_url":   self.SI_API_BASE_URL,    # Log what URL we're hitting
         })
 
         deadline = time.monotonic() + self.TOTAL_DURATION_SECONDS
@@ -164,8 +167,8 @@ class AutonomousAgent:
                 cycle_num   = self._state.cycle_count + 1
 
                 logger.info("agent_cycle_start", extra={
-                    "agent_id": self._agent_id,
-                    "cycle":    cycle_num,
+                    "agent_id":        self._agent_id,
+                    "cycle":           cycle_num,
                     "time_left_hours": round((deadline - time.monotonic()) / 3600, 1),
                 })
 
@@ -180,7 +183,7 @@ class AutonomousAgent:
                 )
                 self._state.decay_alerts.extend(result.decay_alerts)
 
-                # Periodic comprehensive report every REPORT_INTERVAL_CYCLES cycles
+                # Periodic comprehensive report every REPORT_INTERVAL_CYCLES
                 if cycle_num % self.REPORT_INTERVAL_CYCLES == 0:
                     report = await self._generate_report(cycle_num)
                     self._state.reports.append(report)
@@ -197,8 +200,8 @@ class AutonomousAgent:
 
                 if not self._shutdown_event.is_set() and time.monotonic() + wait < deadline:
                     logger.info("agent_sleeping_until_next_cycle", extra={
-                        "agent_id":   self._agent_id,
-                        "wait_min":   round(wait / 60, 1),
+                        "agent_id": self._agent_id,
+                        "wait_min": round(wait / 60, 1),
                         "next_cycle": cycle_num + 1,
                     })
                     try:
@@ -212,15 +215,15 @@ class AutonomousAgent:
             # 72-hour run complete or shutdown requested
             final_report = await self._generate_report(self._state.cycle_count, final=True)
             self._state.reports.append(final_report)
-            self._state.status = AgentStatus.COMPLETED
+            self._state.status        = AgentStatus.COMPLETED
             self._state.total_insights = len(self._state.findings)
             self._save_state()
 
             logger.info("autonomous_agent_completed", extra={
-                "agent_id":    self._agent_id,
-                "cycles":      self._state.cycle_count,
-                "total_docs":  self._state.total_docs,
-                "insights":    self._state.total_insights,
+                "agent_id":     self._agent_id,
+                "cycles":       self._state.cycle_count,
+                "total_docs":   self._state.total_docs,
+                "insights":     self._state.total_insights,
                 "decay_alerts": len(self._state.decay_alerts),
             })
 
@@ -283,27 +286,21 @@ class AutonomousAgent:
         for topic in topics:
             docs = await self._ku.discover(
                 topic=topic,
-                since_hours=1,          # Only new content since last cycle
+                since_hours=1,
                 max_results=5,
             )
             all_docs.extend(docs)
 
-            # Decay threshold check
             stale = [d for d in docs if d.decay_score < self.DECAY_ALERT_THRESHOLD]
             for d in stale:
                 alert = (f"[DECAY ALERT] '{d.title}' decay={d.decay_score:.2f} "
                          f"velocity={d.knowledge_velocity:.2f}")
                 decay_alerts.append(alert)
-                logger.warning("decay_threshold_breached", extra={
-                    "doc_title":   d.title,
-                    "decay_score": d.decay_score,
-                    "topic":       topic,
-                })
 
         logger.info("agent_discovery_done", extra={
-            "cycle":         cycle_num,
-            "docs_found":    len(all_docs),
-            "decay_alerts":  len(decay_alerts),
+            "cycle":        cycle_num,
+            "docs_found":   len(all_docs),
+            "decay_alerts": len(decay_alerts),
         })
 
         # Step 2 — Ingest to SI pipeline ────────────────────
@@ -311,11 +308,6 @@ class AutonomousAgent:
             doc_id = await self._ingest_document(doc)
             if doc_id:
                 ingested_ids.append(doc_id)
-
-        logger.info("agent_ingest_done", extra={
-            "cycle":    cycle_num,
-            "ingested": len(ingested_ids),
-        })
 
         # Step 3 — Wait for fusion worker to process ────────
         processed = 0
@@ -372,7 +364,11 @@ class AutonomousAgent:
         return None
 
     async def _wait_for_processing(self, doc_ids: list[str]) -> int:
-        """Poll ingest status until docs are processed or timeout."""
+        """
+        Poll the /v1/ingest/{doc_id}/status endpoint until docs are
+        processed by the fusion worker, or timeout is reached.
+        FIXED: endpoint now exists in the updated ingest.py.
+        """
         processed = 0
         deadline  = time.monotonic() + self.PROCESS_WAIT_TIMEOUT
 
@@ -388,8 +384,9 @@ class AutonomousAgent:
                         status = resp.json().get("status", "unknown")
                         if status == "processed":
                             processed += 1
-                        elif status == "pending":
+                        elif status in ("pending", "unknown"):
                             remaining.append(doc_id)
+                        # "failed" — don't retry, don't count
                 except Exception:
                     remaining.append(doc_id)
 
@@ -407,10 +404,6 @@ class AutonomousAgent:
         topics: list[str],
         new_docs: int,
     ) -> str:
-        """
-        Query the SI pipeline to synthesise insights from the latest ingested data.
-        Uses chain-of-thought mode for deeper reasoning.
-        """
         query = (
             f"Based on the latest knowledge about {', '.join(topics)}, "
             f"what are the most important developments and insights relevant to: {goal}? "
@@ -420,8 +413,8 @@ class AutonomousAgent:
 
         try:
             resp = await self._http.post("/v1/query", json={
-                "query":   query,
-                "mode":    "chain_of_thought",
+                "query": query,
+                "mode":  "chain_of_thought",
             }, headers={
                 "X-Tenant-ID":  self._agent_id,
                 "Content-Type": "application/json",
@@ -434,7 +427,6 @@ class AutonomousAgent:
         return ""
 
     async def _generate_report(self, cycle: int, final: bool = False) -> dict:
-        """Generate a comprehensive summary report."""
         if not self._state:
             return {}
 
@@ -459,14 +451,14 @@ class AutonomousAgent:
         )
 
         return {
-            "type":           "final_report" if final else "periodic_report",
-            "cycle":          cycle,
-            "generated_at":   datetime.now(timezone.utc).isoformat(),
+            "type":             "final_report" if final else "periodic_report",
+            "cycle":            cycle,
+            "generated_at":     datetime.now(timezone.utc).isoformat(),
             "docs_this_period": total_docs,
-            "processed":      total_processed,
-            "decay_alerts":   self._state.decay_alerts[-20:],
-            "summary":        summary,
-            "key_findings":   recent_findings,
+            "processed":        total_processed,
+            "decay_alerts":     self._state.decay_alerts[-20:],
+            "summary":          summary,
+            "key_findings":     recent_findings,
         }
 
     # ─────────────────────────────────────────
@@ -479,7 +471,6 @@ class AutonomousAgent:
     def _save_state(self) -> None:
         if self._state:
             try:
-                # TTL = 80 hours (72h run + 8h to read results)
                 self._redis.setex(
                     self._redis_key(),
                     80 * 3600,
@@ -490,7 +481,6 @@ class AutonomousAgent:
 
     @classmethod
     def load_from_redis(cls, agent_id: str) -> Optional["AutonomousAgent"]:
-        """Reload an agent from its persisted Redis state."""
         agent = cls(agent_id=agent_id)
         raw = agent._redis.get(agent._redis_key())
         if raw:

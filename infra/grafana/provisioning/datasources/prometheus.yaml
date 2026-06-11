@@ -1,0 +1,18 @@
+# ============================================================
+# infra/grafana/provisioning/datasources/prometheus.yaml
+# Auto-provisions Prometheus as a datasource on Grafana startup
+# FIX: infra/grafana/ directory was entirely missing
+# ============================================================
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://si-prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: "15s"

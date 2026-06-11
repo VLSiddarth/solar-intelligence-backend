@@ -140,7 +140,7 @@ services:
 
   etcd:
     # FIX 2: bitnami (not bitnamilegacy) — correct Docker Hub namespace
-    image: bitnami/etcd:3.5.12
+    image: bitnamilegacy/etcd:3.5.12
     container_name: si-etcd
     environment:
       ALLOW_NONE_AUTHENTICATION: "yes"
@@ -219,7 +219,8 @@ services:
   tgi:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.7
     container_name: si-tgi
-    command: --model-id BAAI/bge-m3 --port 8080 --max-client-batch-size 32
+    # FIX: Swapped to a tiny 33M parameter model for 8GB RAM hosts
+    command: --model-id BAAI/bge-small-en-v1.5 --port 8080 --max-client-batch-size 32
     ports:
       - "8080:8080"
     volumes:
