@@ -1,6 +1,14 @@
 # ============================================================
-# shared/models/entities.py
-# All Pydantic data models shared across SI layers
+# shared/models/entities.py — FIXED
+#
+# BUG FIXED: LLMResponse was missing `truncated` and `provider`
+#   fields. token_governor.py creates LLMResponse(...,
+#   truncated=truncated, provider=self._provider) but these
+#   fields didn't exist in the model — causing ValidationError
+#   every time the full orchestrator path was exercised.
+#
+# ALSO: TokenUsage.mode is now Optional so cache-hit responses
+#   (which don't have a mode) don't fail validation.
 # ============================================================
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -10,9 +18,9 @@ from enum import Enum
 import uuid
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # Core Enums
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 class EntityType(str, Enum):
     PERSON       = "Person"
@@ -29,14 +37,14 @@ class EntityType(str, Enum):
 
 
 class RelationshipType(str, Enum):
-    HAS_ROLE   = "HAS_ROLE"
+    HAS_ROLE    = "HAS_ROLE"
     AUTHORED_BY = "AUTHORED_BY"
-    RELATES_TO = "RELATES_TO"
-    USES       = "USES"
-    BELONGS_TO = "BELONGS_TO"
-    MENTIONS   = "MENTIONS"
-    GOVERNS    = "GOVERNS"
-    MEASURES   = "MEASURES"
+    RELATES_TO  = "RELATES_TO"
+    USES        = "USES"
+    BELONGS_TO  = "BELONGS_TO"
+    MENTIONS    = "MENTIONS"
+    GOVERNS     = "GOVERNS"
+    MEASURES    = "MEASURES"
 
 
 class RouteTier(str, Enum):
@@ -57,9 +65,9 @@ class Priority(str, Enum):
     P2 = "P2"
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # Layer I: Core — Data Fusion Models
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 class RawDocument(BaseModel):
     """Input to the Core fusion pipeline."""
@@ -112,7 +120,7 @@ class FusedKnowledge(BaseModel):
     correlation_id: str
     fused_at: datetime = Field(default_factory=datetime.utcnow)
     token_cost: int = 0
-    model_used: str = "gpt-4o-mini"
+    model_used: str = "llama-3.1-8b-instant"
 
 
 class DedupCandidate(BaseModel):
@@ -120,16 +128,16 @@ class DedupCandidate(BaseModel):
     entity_a_id: str
     entity_b_id: str
     cosine_similarity: float
-    requires_review: bool  # True if similarity > threshold but < 1.0
+    requires_review: bool
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # Layer II: Radiative — Vector Models
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 class EmbeddingRequest(BaseModel):
     texts: list[str]
-    model: str = "BAAI/bge-m3"
+    model: str = "BAAI/bge-small-en-v1.5"
     normalize: bool = True
 
 
@@ -179,9 +187,9 @@ class CacheEntry(BaseModel):
     tenant_id: str
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # Layer III: Convective — Routing Models
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 class RoutingRequest(BaseModel):
     query: str
@@ -217,7 +225,7 @@ class TokenUsage(BaseModel):
     completion_tokens: int
     total_tokens: int
     cost_usd: float
-    mode: QueryMode
+    mode: Optional[QueryMode] = None    # Optional: cache hits don't have a mode
     truncated: bool = False
 
 
@@ -225,13 +233,16 @@ class LLMResponse(BaseModel):
     content: str
     usage: TokenUsage
     model: str
-    latency_ms: float
-    correlation_id: str
+    latency_ms: float = 0.0
+    correlation_id: str = ""
+    # FIXED: Added truncated and provider — token_governor creates these fields
+    truncated: bool = False
+    provider: str = ""
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # Layer IV: Photosphere — API Models
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 class IngestRequest(BaseModel):
     """Public API: ingest a document into SI."""
@@ -292,12 +303,12 @@ class MCPError(BaseModel):
         }
         return cls(
             error={
-                "code": code,
-                "type": ERROR_TYPES.get(code, "unknown_error"),
-                "message": message,
+                "code":       code,
+                "type":       ERROR_TYPES.get(code, "unknown_error"),
+                "message":    message,
                 "request_id": request_id,
-                "layer": layer,
-                "timestamp": datetime.utcnow().isoformat(),
+                "layer":      layer,
+                "timestamp":  datetime.utcnow().isoformat(),
             }
         )
 
@@ -311,9 +322,9 @@ class HealthStatus(BaseModel):
     version: str = "1.0.0"
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 # Layer V: Corona — Telemetry Models
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
 
 class TraceSpan(BaseModel):
     """A single trace span propagated through all 5 layers."""
@@ -356,5 +367,5 @@ class EnforcementAction(BaseModel):
     action: Literal["kill", "redirect", "warn"]
     reason: str
     detected_at: datetime = Field(default_factory=datetime.utcnow)
-    latency_ms: float  # time from detect to action
+    latency_ms: float
     correlation_id: str
