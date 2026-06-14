@@ -129,7 +129,21 @@ class AgentOrchestrator:
 
             try:
                 # Retrieve relevant context from vector index
-                search_results = []  # Skip vector search until TGI is ready
+                # FIXED: TGI is ready. Run real vector search.
+                query_embedding = []
+                try:
+                    query_embedding = await self._embedder.embed_single(query)
+                except Exception as e:
+                    logger.warning("orchestrator_embed_failed", extra={"error": str(e)})
+
+                search_results = []
+                if query_embedding:
+                    try:
+                        search_results = self._index.query(
+                            query_embedding, tenant_id=tenant, top_k=10
+                        )
+                    except Exception as e:
+                        logger.warning("orchestrator_vector_search_failed", extra={"error": str(e)})
 
                 ctx_state["sources"]  = search_results
                 ctx_state["hop"]      = hop
