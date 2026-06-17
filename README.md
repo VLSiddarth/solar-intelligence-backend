@@ -20,6 +20,36 @@
 </div>
 
 ---
+## ⚡ Production Telemetry & Infrastructure
+
+Solar Intelligence is not a wrapper; it is a fully observable, event-driven microservices cluster. Here is a look at the live orchestration:
+
+<p align="center">
+  <img src="The Orchestration Boundary.png" width="800" alt="The Orchestration Boundary (FastAPI)"><br>
+  <em>The Orchestration Boundary (FastAPI)</em>
+</p>
+
+<p align="center">
+  <img src="High-Throughput Event Streaming.png" width="800" alt="High-Throughput Event Streaming (Redpanda)"><br>
+  <em>High-Throughput Event Streaming (Redpanda)</em>
+</p>
+
+<p align="center">
+  <img src="Live Telemetry & Message Activity.png" width="800" alt="Live Telemetry & Message Activity (Grafana)"><br>
+  <em>Live Telemetry & Message Activity (Grafana)</em>
+</p>
+
+<p align="center">
+  <img src="Distributed Tracing .png" width="800" alt="Distributed Tracing for the Retrieval Latency (Jaeger)"><br>
+  <em>Distributed Tracing for Retrieval/Decay Latency (Jaeger)</em>
+</p>
+
+<p align="center">
+  <img src="State & Cache Management.png" width="800" alt="State & Cache Management (Redis)"><br>
+  <em>State & Cache Management (Redis)</em>
+</p>
+
+---
 
 ## The Problem SI Solves
 
